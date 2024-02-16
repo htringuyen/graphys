@@ -1,6 +1,5 @@
 package io.graphys.util;
 
-import org.springframework.web.client.RestTemplate;
 
 import java.io.File;
 import java.io.IOException;
@@ -56,18 +55,4 @@ public class FileUtils {
         }
         return null;
     }
-
-    static String headForHeadersWithRestTemplate(URL url) {
-        var webClient = new RestTemplate();
-        try {
-            var headers = webClient.headForHeaders(url.toURI());
-            return headers.toString();
-        }
-        catch (Exception e) {
-            e.printStackTrace();
-        }
-
-        return null;
-    }
-
 }

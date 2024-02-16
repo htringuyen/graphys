@@ -19,3 +19,4 @@ reactor-core = { group = "io.projectreactor", name = "reactor-core", version.ref
 spring-web = { group = "org.springframework", name = "spring-web", version.ref = "spring-ver" }
 spring-core = { group = "org.springframework", name = "spring-core", version.ref = "spring-ver"}
 spring-context = { group = "org.springframework", name = "spring-context", version.ref = "spring-ver"}
+spring-test = { group = "org.springframework", name = "spring-test", version.ref = "spring-ver" }

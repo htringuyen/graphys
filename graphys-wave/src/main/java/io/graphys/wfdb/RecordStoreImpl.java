@@ -1,9 +1,6 @@
-package io.graphys.wave.internal.store;
+package io.graphys.wfdb;
 
 import io.graphys.util.FileUtils;
-import io.graphys.wave.metadata.DatabaseInfo;
-import org.apache.logging.log4j.LogManager;
-import org.apache.logging.log4j.Logger;
 
 import java.io.File;
 import java.io.FileNotFoundException;
@@ -13,53 +10,96 @@ import java.net.URI;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.*;
-import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentLinkedQueue;
-import java.util.concurrent.CopyOnWriteArrayList;
-import java.util.concurrent.atomic.AtomicInteger;
+import java.util.stream.Collectors;
 
-public class PathStoreImpl implements PathStore {
-    private static final Logger logger = LogManager.getLogger(PathStoreImpl.class);
-    private static final String RECORD_LIST_FILE_NAME = "RECORDS";
-    private static final String LOCAL_RECORD_PATHS_FILE_NAME = "RECORD_PATHS.csv";
-    private static final int DEFAULT_CACHE_SIZE = 200;
+public class RecordStoreImpl implements RecordStore {
+    static final String RECORD_LIST_FILE_NAME = "RECORDS";
+
+    static final String LOCAL_RECORD_PATHS_FILE_NAME = "RECORD_PATHS.csv";
+
+    private static final String SEGMENT_BOUNDARY_MARK = "<>";
+
     private final DatabaseInfo dbInfo;
-    private int cacheSize = DEFAULT_CACHE_SIZE;
-    private final Map<String, String> cacheMap = new ConcurrentHashMap<>(DEFAULT_CACHE_SIZE);
 
-    public PathStoreImpl(DatabaseInfo dbInfo) {
+    private final PathRetriever pathRetriever;
+
+    private final RecordRetriever recordRetriever;
+
+    public RecordStoreImpl(DatabaseInfo dbInfo, int pathCachingLimit, int recordCachingLimit) {
         this.dbInfo = dbInfo;
+
+        this.pathRetriever = new PathRetrieverImpl(dbInfo, pathCachingLimit);
+
+        this.recordRetriever = new RecordRetrieverImpl(dbInfo, pathRetriever, recordCachingLimit);
     }
 
     @Override
-    public void setCacheSize(int size) {
-        this.cacheSize = size;
+    public DatabaseInfo dbInfo() {
+        return dbInfo;
     }
 
     @Override
-    public String getDbName() {
-        return dbInfo.name();
+    public PathRetriever pathRetriever() {
+        return pathRetriever;
     }
 
     @Override
-    public void rebuild() {
+    public RecordRetriever recordRetriever() {
+        return recordRetriever;
+    }
+
+    @Override
+    public void buildRecordStore() {
+        buildRecordStore(false);
+    }
+
+    @Override
+    public void buildRecordStore(boolean forceRebuild) {
+        if (forceRebuild) {
+            buildRecordStoreHelper();
+        }
+        else {
+            if (!storeExists()) {
+                buildRecordStoreHelper();
+            }
+        }
+    }
+
+    private boolean storeExists() {
+        var dbUri = dbInfo.localUri();
+        return Files.isDirectory(Path.of(dbUri))
+                && Files.exists(Path.of(dbUri.resolve(RECORD_LIST_FILE_NAME)))
+                && Files.exists(Path.of(dbUri.resolve(LOCAL_RECORD_PATHS_FILE_NAME)));
+    }
+
+    private void buildRecordStoreHelper() {
         var recordPaths = Collections.synchronizedList(new LinkedList<String>());
         var pathAppenders = new ConcurrentHashMap<URI, List<String>>();
-        pathAppenders.put(dbInfo.localUri(), new LinkedList<>());
+        pathAppenders.put(dbInfo.localUri(), Collections.synchronizedList(new LinkedList<>()));
 
         var dir = new File(dbInfo.localUri());
         if (! dir.isDirectory() && ! dir.mkdirs()) {
-            throw new RuntimeException("Error when creating directory.");
+            throw new RuntimeException("Error when creating directory: " + dir);
         }
-        buildLocalPathStore(dbInfo.remoteUri(), dbInfo.localUri(),
+        buildRecordStoreHelper(dbInfo.remoteUri(), dbInfo.localUri(), "",
                 pathAppenders, 1, new HashMap<Integer, String>(), recordPaths);
 
 
         try (var out = new PrintWriter(
                 new File(dbInfo.localUri().resolve(LOCAL_RECORD_PATHS_FILE_NAME)))) {
             recordPaths.stream()
-                    .map(path -> extractRecordIdFrom(path) + "," + path)
+                    .map(segmentablePath -> {
+                        var result = new StringBuilder();
+                        var purePath = segmentablePath.replace(SEGMENT_BOUNDARY_MARK, "");
+                        result.append(extractRecordNameFrom(purePath)).append(",");
+                        result.append(
+                                Arrays.stream(segmentablePath.split(SEGMENT_BOUNDARY_MARK))
+                                        .filter(s -> !s.isBlank())
+                                        .collect(Collectors.joining(","))
+                        );
+                        return result.toString();
+                    })
                     .sorted()
                     .forEach(out::println);
         }
@@ -82,46 +122,8 @@ public class PathStoreImpl implements PathStore {
         });
     }
 
-    @Override
-    public List<String> getPathsOf(int level) {
-        return getPathsOfHelper("", 1, level);
-    }
-
-    @Override
-    public List<String> getAllPaths() {
-        return getPathsOfHelper("", 1, -1);
-    }
-
-    @Override
-    public String getPathByRecordId(String recordId) {
-        return null;
-    }
-
-    private List<String> getPathsOfHelper(String currentPath, int level, int limit) {
-        var file = new File(dbInfo.localUri().resolve(currentPath).resolve(RECORD_LIST_FILE_NAME));
-
-        if (!file.exists() || (limit > 0 && level > limit)) {
-            var result = new ArrayList<String>();
-            result.add(currentPath);
-            return result;
-        }
-
-        try (var in = new Scanner(file.toPath())) {
-            return in.tokens()
-                    .parallel()
-                    .map(str -> URI.create(currentPath).resolve(str).toString())
-                    .flatMap(str -> getPathsOfHelper(str, level + 1, limit).stream())
-                    .toList();
-        }
-        catch (IOException e) {
-            e.printStackTrace();
-            throw new RuntimeException("Error when reading file.");
-        }
-    }
-
-
-    private void buildLocalPathStore(URI remoteUri, URI localUri, Map<URI,
-            List<String>> pathAppenders, int level, Map<Integer, String> levelMap, List<String> recordPaths) {
+    private void buildRecordStoreHelper(URI remoteUri, URI localUri, String segmentablePath, Map<URI, List<String>> pathAppenders,
+                                        int level, Map<Integer, String> levelMap, List<String> recordPaths) {
         try (var in = new Scanner(remoteUri.resolve(RECORD_LIST_FILE_NAME).toURL().openStream())) {
             in.tokens().parallel()
                     .filter(s -> !s.isBlank())
@@ -141,11 +143,12 @@ public class PathStoreImpl implements PathStore {
 
                             pathAppenders.put(localUri.resolve(str), new LinkedList<>());
 
-                            buildLocalPathStore(remoteUri.resolve(str), localUri.resolve(str),
+                            buildRecordStoreHelper(remoteUri.resolve(str), localUri.resolve(str),
+                                    segmentablePath + SEGMENT_BOUNDARY_MARK + str,
                                     pathAppenders, level + 1, levelMap, recordPaths);
                         }
                         else {
-                            recordPaths.add(extractRecordPathFrom(remoteUri.resolve(str).toString()));
+                            recordPaths.add(segmentablePath + SEGMENT_BOUNDARY_MARK + str);
                             str = str.substring(0, str.lastIndexOf("/"));
                             var appendedDir = new File(localUri.resolve(str));
                             if (! appendedDir.isDirectory() && ! appendedDir.mkdirs()) {
@@ -182,13 +185,13 @@ public class PathStoreImpl implements PathStore {
         return false;
     }
 
-    private String extractRecordIdFrom(String uriStr) {
+    private String extractRecordNameFrom(String uriStr) {
         var startInd = 1 + uriStr.lastIndexOf("/");
-        var recordId = uriStr.substring(startInd);
-        if (recordId.isBlank()) {
+        var recordName = uriStr.substring(startInd);
+        if (recordName.isBlank()) {
             throw new RuntimeException("Unexpected result when extract record id.");
         }
-        return recordId;
+        return recordName;
     }
 
     private String extractRecordPathFrom(String uriStr) {
@@ -205,31 +208,6 @@ public class PathStoreImpl implements PathStore {
         return uriStr.charAt(index) != File.separator.charAt(0)
                 ? uriStr.substring(index) : uriStr.substring(index + 1);
     }
-
-    @Override
-    public PathRetriever retriever() {
-        return null;
-    }
-
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
